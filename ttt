@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+
+set -e
+
+BASE="$HOME/pesquisa_singular_densa"
+DATA="$(date '+%Y-%m-%d_%H-%M-%S')"
+
+# Ajustes principais
+ANO_INICIO=1996
+ANO_FIM="$(date '+%Y')"
+
+# 0 = sem limite por ano.
+# Se ficar pesado demais, mude para 500, 1000, 2000 etc.
+LIMIT_POR_ANO=0
+
+# 1 = baixa imagens públicas encontradas; 0 = apenas cataloga imagens.
+# Recomendo deixar 0 para não ficar enorme.
+BAIXAR_IMAGENS=0
+
+# 1 = usa collapse=digest no Wayback para não baixar cópias idênticas.
+# 0 = tenta baixar tudo mesmo que repetido, pode ficar gigante.
+USAR_DEDUPE_WAYBACK=1
+
+mkdir -p "$BASE"/{
+  atual/html,
+  atual/pdf,
+  atual/txt,
+  atual/sitemaps,
+  wayback/cdx,
+  wayback/html,
+  wayback/pdf,
+  wayback/txt,
+  commoncrawl/index,
+  commoncrawl/html,
+  commoncrawl/txt,
+  imagens/listas,
+  imagens/arquivos,
+  links,
+  json,
+  relatorios,
+  logs,
+  scripts,
+  exportar_windows
+}
+
+cd "$BASE"
+
+echo "============================================================"
+echo "PESQUISA SINGULAR - MODO DENSO"
+echo "Base: $BASE"
+echo "Data: $DATA"
+echo "============================================================"
+
+echo "== Instalando dependências =="
+sudo apt update
+sudo apt install -y \
+  wget \
+  curl \
+  jq \
+  lynx \
+  ripgrep \
+  python3 \
+  python3-pip \
+  python3-venv \
+  poppler-utils \
+  zip \
+  unzip \
+  git \
+  ca-certificates \
+  coreutils \
+  sed \
+  gawk \
+  grep
+
+echo "== Criando ambiente Python =="
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+fi
+
+source .venv/bin/activate
+pip install --upgrade pip
+pip install \
+  requests \
+  beautifulsoup4 \
+  trafilatura \
+  lxml \
+  pandas \
+  tqdm
+
+echo "== Domínios e URLs iniciais =="
+
+cat > links/dominios.txt <<'EOF'
+site.singular.com.br
+singular.com.br
+www.singular.com.br
+EOF
+
+cat > links/urls_seed.txt <<'EOF'
+https://site.singular.com.br/
+https://site.singular.com.br/o-singular
+https://www.singular.com.br/
+EOF
+
+cat > links/termos_busca_manual.txt <<'EOF'
+"Colégio Singular" "1966"
+"Curso Pré-Engenharia Singular"
+"Colégio Singular" história
+"Colégio Singular" "50 anos"
+"Colégio Singular" "55 anos"
+"Colégio Singular" "60 anos"
+"Singular Anglo"
+"Singular" "Liceu Monteiro Lobato"
+"Singular" "Ciências e Letras Vestibulares"
+"Colégio Singular" "Santo André"
+"Colégio Singular" "São Bernardo"
+"Colégio Singular" "São Caetano"
+"Paolo Gambogi" Singular
+"Paulo Roberto De Francisco" Singular
+"Singular" "University of Missouri"
+"Singular" "Texas Tech"
+"Singular" "Cambridge"
+site:site.singular.com.br Singular
+site:singular.com.br Singular
+filetype:pdf "Colégio Singular"
+filetype:pdf "Singular Anglo"
+EOF
+
+echo "== Baixando robots.txt e sitemaps conhecidos =="
+
+while read -r dominio; do
+  [ -z "$dominio" ] && continue
+
+  mkdir -p "atual/sitemaps/$dominio"
+
+  curl -L --max-time 30 "https://$dominio/robots.txt" \
+    -o "atual/sitemaps/$dominio/robots.txt" || true
+
+  curl -L --max-time 30 "https://$dominio/sitemap.xml" \
+    -o "atual/sitemaps/$dominio/sitemap.xml" || true
+
+  curl -L --max-time 30 "https://$dominio/sitemap_index.xml" \
+    -o "atual/sitemaps/$dominio/sitemap_index.xml" || true
+
+  sleep 1
+done < links/dominios.txt
+
+echo "== Extraindo URLs de sitemaps =="
+
+cat > scripts/extrair_sitemaps.py <<'PY'
+import os
+import re
+import glob
+from bs4 import BeautifulSoup
+
+BASE = os.path.expanduser("~/pesquisa_singular_densa")
+saida = os.path.join(BASE, "links", "urls_sitemaps.txt")
+arquivos = glob.glob(os.path.join(BASE, "atual", "sitemaps", "**", "*.xml"), recursive=True)
+
+urls = set()
+
+for arq in arquivos:
+    try:
+        with open(arq, "r", encoding="utf-8", errors="ignore") as f:
+            conteudo = f.read()
+
+        soup = BeautifulSoup(conteudo, "xml")
+
+        for loc in soup.find_all("loc"):
+            url = loc.get_text(strip=True)
+            if url:
+                urls.add(url)
+
+        for url in re.findall(r"https?://[^\s<>'\"]+", conteudo):
+            urls.add(url.strip())
+
+    except Exception:
+        pass
+
+with open(saida, "w", encoding="utf-8") as f:
+    for url in sorted(urls):
+        f.write(url + "\n")
+
+print(f"URLs de sitemap: {len(urls)}")
+PY
+
+python scripts/extrair_sitemaps.py
+
+echo "== Juntando URLs iniciais =="
+cat links/urls_seed.txt links/urls_sitemaps.txt 2>/dev/null \
+  | sort -u > links/urls_iniciais_todas.txt
+
+echo "== Baixando site atual de forma recursiva =="
+
+wget \
+  --recursive \
+  --level=10 \
+  --convert-links \
+  --adjust-extension \
+  --page-requisites \
+  --no-parent \
+  --wait=2 \
+  --random-wait \
+  --limit-rate=800k \
+  --user-agent="PesquisaHistoricaSingularDensa/1.0" \
+  --execute robots=on \
+  -P atual/html \
+  https://site.singular.com.br/ \
+  2>&1 | tee "logs/wget_atual_site_$DATA.log" || true
+
+echo "== Baixando URLs de seed e sitemap =="
+
+while read -r url; do
+  [ -z "$url" ] && continue
+
+  echo "URL atual: $url"
+
+  wget \
+    --page-requisites \
+    --convert-links \
+    --adjust-extension \
+    --wait=2 \
+    --random-wait \
+    --limit-rate=800k \
+    --user-agent="PesquisaHistoricaSingularDensa/1.0" \
+    --execute robots=on \
+    -P atual/html/urls \
+    "$url" \
+    2>> "logs/wget_atual_urls_$DATA.log" || true
+
+done < links/urls_iniciais_todas.txt
+
+echo "== Extraindo todos os links do material atual =="
+
+find atual/html -type f \( -name "*.html" -o -name "*.htm" \) -print0 \
+  | xargs -0 grep -Ehoi 'href="[^"]+"' \
+  | sed 's/href="//; s/"//' \
+  | sort -u > links/links_extraidos_atual.txt || true
+
+grep -Eio 'https?://[^ ]+' links/links_extraidos_atual.txt \
+  | sort -u > links/urls_absolutas_extraidas_atual.txt || true
+
+grep -Ei '\.pdf($|\?)' links/links_extraidos_atual.txt \
+  | sort -u > links/pdfs_atual.txt || true
+
+grep -Ei '\.(jpg|jpeg|png|webp|gif)($|\?)' links/links_extraidos_atual.txt \
+  | sort -u > imagens/listas/imagens_atual.txt || true
+
+echo "== Baixando PDFs atuais =="
+
+while read -r pdfurl; do
+  [ -z "$pdfurl" ] && continue
+
+  safe="$(echo "$pdfurl" | sha1sum | awk '{print $1}')"
+
+  wget \
+    --wait=2 \
+    --random-wait \
+    --limit-rate=800k \
+    --user-agent="PesquisaHistoricaSingularDensa/1.0" \
+    -O "atual/pdf/${safe}.pdf" \
+    "$pdfurl" \
+    2>> "logs/wget_pdfs_atual_$DATA.log" || true
+
+  echo "$safe,$pdfurl" >> links/pdfs_atual_baixados.csv
+
+done < links/pdfs_atual.txt
+
+if [ "$BAIXAR_IMAGENS" = "1" ]; then
+  echo "== Baixando imagens atuais =="
+
+  while read -r imgurl; do
+    [ -z "$imgurl" ] && continue
+
+    safe="$(echo "$imgurl" | sha1sum | awk '{print $1}')"
+
+    wget \
+      --wait=1 \
+      --random-wait \
+      --limit-rate=800k \
+      --user-agent="PesquisaHistoricaSingularDensa/1.0" \
+      -O "imagens/arquivos/${safe}" \
+      "$imgurl" \
+      2>> "logs/wget_imagens_$DATA.log" || true
+
+    echo "$safe,$imgurl" >> imagens/listas/imagens_baixadas.csv
+
+  done < imagens/listas/imagens_atual.txt
+fi
+
+echo "== Extraindo texto do site atual =="
+
+find atual/html -type f \( -name "*.html" -o -name "*.htm" \) | while read -r arq; do
+  safe="$(echo "$arq" | sha1sum | awk '{print $1}')"
+  lynx -dump -nolist "$arq" > "atual/txt/${safe}.txt" || true
+  echo "$safe,$arq" >> links/html_atual_extraidos.csv
+done
+
+find atual/pdf -type f -name "*.pdf" | while read -r arq; do
+  safe="$(basename "$arq" .pdf)"
+  pdftotext "$arq" "atual/txt/pdf_${safe}.txt" || true
+done
+
+echo "== Wayback Machine: coletando CDX por ano e domínio =="
+
+> links/wayback_urls_por_ano.csv
+
+while read -r dominio; do
+  [ -z "$dominio" ] && continue
+
+  echo "Domínio Wayback: $dominio"
+
+  for ano in $(seq "$ANO_INICIO" "$ANO_FIM"); do
+    echo "  Ano: $ano"
+
+    mkdir -p "wayback/cdx/$ano"
+
+    if [ "$USAR_DEDUPE_WAYBACK" = "1" ]; then
+      CDX_URL="https://web.archive.org/cdx?url=${dominio}/*&from=${ano}&to=${ano}&output=json&fl=timestamp,original,statuscode,mimetype,digest&filter=statuscode:200&collapse=digest"
+    else
+      CDX_URL="https://web.archive.org/cdx?url=${dominio}/*&from=${ano}&to=${ano}&output=json&fl=timestamp,original,statuscode,mimetype,digest&filter=statuscode:200"
+    fi
+
+    curl -L \
+      --max-time 90 \
+      --retry 2 \
+      "$CDX_URL" \
+      -o "wayback/cdx/$ano/${dominio}.json" || true
+
+    if [ ! -s "wayback/cdx/$ano/${dominio}.json" ]; then
+      sleep 1
+      continue
+    fi
+
+    if [ "$LIMIT_POR_ANO" = "0" ]; then
+      jq -r --arg ano "$ano" --arg dominio "$dominio" '
+        .[1:][]? | [$ano, $dominio, .[0], .[1], .[3], .[4]] | @csv
+      ' "wayback/cdx/$ano/${dominio}.json" >> links/wayback_urls_por_ano.csv || true
+    else
+      jq -r --arg ano "$ano" --arg dominio "$dominio" '
+        .[1:][]? | [$ano, $dominio, .[0], .[1], .[3], .[4]] | @csv
+      ' "wayback/cdx/$ano/${dominio}.json" | head -n "$LIMIT_POR_ANO" >> links/wayback_urls_por_ano.csv || true
+    fi
+
+    sleep 1
+  done
+
+done < links/dominios.txt
+
+echo "== Total Wayback encontrado =="
+wc -l links/wayback_urls_por_ano.csv || true
+
+echo "== Baixando Wayback HTML/PDF/texto por ano =="
+
+> links/wayback_arquivos_baixados.csv
+
+cat links/wayback_urls_por_ano.csv | while IFS=, read -r ano dominio timestamp original mimetype digest; do
+  ano="$(echo "$ano" | tr -d '"')"
+  dominio="$(echo "$dominio" | tr -d '"')"
+  timestamp="$(echo "$timestamp" | tr -d '"')"
+  original="$(echo "$original" | sed 's/^"//; s/"$//')"
+  mimetype="$(echo "$mimetype" | tr -d '"')"
+  digest="$(echo "$digest" | tr -d '"')"
+
+  [ -z "$ano" ] && continue
+  [ -z "$timestamp" ] && continue
+  [ -z "$original" ] && continue
+
+  mkdir -p "wayback/html/$ano" "wayback/pdf/$ano" "wayback/txt/$ano"
+
+  hash="$(echo -n "${timestamp}_${original}" | sha1sum | awk '{print $1}')"
+
+  if echo "$original" | grep -Eiq '\.pdf($|\?)' || echo "$mimetype" | grep -Eiq 'pdf'; then
+    saida="wayback/pdf/$ano/${hash}.pdf"
+  else
+    saida="wayback/html/$ano/${hash}.html"
+  fi
+
+  if [ -f "$saida" ]; then
+    continue
+  fi
+
+  echo "Wayback $ano: $original"
+
+  curl -L \
+    --max-time 50 \
+    --retry 2 \
+    --user-agent "PesquisaHistoricaSingularDensa/1.0" \
+    "https://web.archive.org/web/${timestamp}id_/${original}" \
+    -o "$saida" || true
+
+  echo "$ano,$dominio,$timestamp,$original,$mimetype,$digest,$saida" >> links/wayback_arquivos_baixados.csv
+
+  sleep 1
+done
+
+echo "== Extraindo texto do Wayback =="
+
+find wayback/html -type f -name "*.html" | while read -r arq; do
+  ano="$(echo "$arq" | awk -F/ '{print $(NF-1)}')"
+  nome="$(basename "$arq" .html)"
+  lynx -dump -nolist "$arq" > "wayback/txt/$ano/${nome}.txt" || true
+done
+
+find wayback/pdf -type f -name "*.pdf" | while read -r arq; do
+  ano="$(echo "$arq" | awk -F/ '{print $(NF-1)}')"
+  nome="$(basename "$arq" .pdf)"
+  pdftotext "$arq" "wayback/txt/$ano/pdf_${nome}.txt" || true
+done
+
+echo "== Common Crawl: consultando índices públicos =="
+
+cat > scripts/commoncrawl_coletar.py <<'PY'
+import os
+import json
+import time
+import gzip
+import requests
+from urllib.parse import quote
+
+BASE = os.path.expanduser("~/pesquisa_singular_densa")
+DOMINIOS = os.path.join(BASE, "links", "dominios.txt")
+INDEX_DIR = os.path.join(BASE, "commoncrawl", "index")
+HTML_DIR = os.path.join(BASE, "commoncrawl", "html")
+LOG = os.path.join(BASE, "logs", "commoncrawl.log")
+
+os.makedirs(INDEX_DIR, exist_ok=True)
+os.makedirs(HTML_DIR, exist_ok=True)
+
+session = requests.Session()
+session.headers.update({"User-Agent": "PesquisaHistoricaSingularDensa/1.0"})
+
+def log(msg):
+    print(msg)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+try:
+    collinfo = session.get("https://index.commoncrawl.org/collinfo.json", timeout=60).json()
+except Exception as e:
+    log(f"Erro ao obter collinfo: {e}")
+    raise SystemExit
+
+# Pega índices mais recentes e alguns antigos.
+# Se quiser ainda mais, remova o [:12].
+indexes = [c["id"] for c in collinfo]
+indexes = indexes[:12]
+
+with open(DOMINIOS, "r", encoding="utf-8") as f:
+    dominios = [x.strip() for x in f if x.strip()]
+
+all_records_path = os.path.join(BASE, "links", "commoncrawl_registros.jsonl")
+
+with open(all_records_path, "w", encoding="utf-8") as allout:
+    for index in indexes:
+        for dominio in dominios:
+            url = f"https://index.commoncrawl.org/{index}-index?url={quote(dominio + '/*')}&output=json&filter=status:200"
+
+            log(f"Consultando {index} - {dominio}")
+
+            try:
+                r = session.get(url, timeout=90)
+                if r.status_code != 200:
+                    log(f"  status {r.status_code}")
+                    continue
+
+                linhas = [x for x in r.text.splitlines() if x.strip()]
+                out_path = os.path.join(INDEX_DIR, f"{index}_{dominio}.jsonl")
+
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for linha in linhas:
+                        f.write(linha + "\n")
+                        allout.write(linha + "\n")
+
+                log(f"  registros: {len(linhas)}")
+
+            except Exception as e:
+                log(f"  erro: {e}")
+
+            time.sleep(1)
+
+print(f"Registros Common Crawl em: {all_records_path}")
+PY
+
+python scripts/commoncrawl_coletar.py || true
+
+echo "== Extração limpa e unificada em Python =="
+
+cat > scripts/extrair_unificado.py <<'PY'
+import os
+import re
+import json
+import glob
+from bs4 import BeautifulSoup
+import trafilatura
+
+BASE = os.path.expanduser("~/pesquisa_singular_densa")
+
+fontes = []
+
+def add_htmls(padrao, origem):
+    for arq in glob.glob(padrao, recursive=True):
+        fontes.append((arq, origem, "html"))
+
+def add_txts(padrao, origem):
+    for arq in glob.glob(padrao, recursive=True):
+        fontes.append((arq, origem, "txt"))
+
+add_htmls(os.path.join(BASE, "atual", "html", "**", "*.html"), "site_atual")
+add_htmls(os.path.join(BASE, "atual", "html", "**", "*.htm"), "site_atual")
+add_htmls(os.path.join(BASE, "wayback", "html", "**", "*.html"), "wayback")
+add_txts(os.path.join(BASE, "atual", "txt", "**", "*.txt"), "texto_atual")
+add_txts(os.path.join(BASE, "wayback", "txt", "**", "*.txt"), "texto_wayback")
+add_txts(os.path.join(BASE, "commoncrawl", "txt", "**", "*.txt"), "commoncrawl")
+
+resultados = []
+vistos_hash_texto = set()
+
+for arq, origem, tipo in fontes:
+    try:
+        if tipo == "html":
+            with open(arq, "r", encoding="utf-8", errors="ignore") as f:
+                html = f.read()
+
+            soup = BeautifulSoup(html, "lxml")
+            titulo = soup.title.get_text(" ", strip=True) if soup.title else ""
+            texto = trafilatura.extract(html) or soup.get_text(" ", strip=True)
+
+        else:
+            with open(arq, "r", encoding="utf-8", errors="ignore") as f:
+                texto = f.read()
+            titulo = ""
+
+        texto = re.sub(r"\s+", " ", texto or "").strip()
+
+        if len(texto) < 80:
+            continue
+
+        texto_key = hash(texto[:5000])
+        duplicado = texto_key in vistos_hash_texto
+        vistos_hash_texto.add(texto_key)
+
+        anos = sorted(set(re.findall(r"\b(18[0-9]{2}|19[0-9]{2}|20[0-9]{2})\b", texto)))
+
+        resultados.append({
+            "arquivo": arq,
+            "origem": origem,
+            "tipo": tipo,
+            "titulo": titulo,
+            "duplicado_aproximado": duplicado,
+            "anos_citados": anos,
+            "tamanho_texto": len(texto),
+            "texto": texto
+        })
+
+    except Exception as e:
+        resultados.append({
+            "arquivo": arq,
+            "origem": origem,
+            "erro": str(e)
+        })
+
+saida_json = os.path.join(BASE, "json", "corpus_unificado.json")
+saida_txt = os.path.join(BASE, "relatorios", "corpus_unificado.txt")
+
+with open(saida_json, "w", encoding="utf-8") as f:
+    json.dump(resultados, f, ensure_ascii=False, indent=2)
+
+with open(saida_txt, "w", encoding="utf-8") as f:
+    for item in resultados:
+        if item.get("erro"):
+            continue
+
+        f.write("=" * 120 + "\n")
+        f.write(f"ORIGEM: {item.get('origem')}\n")
+        f.write(f"ARQUIVO: {item.get('arquivo')}\n")
+        f.write(f"TÍTULO: {item.get('titulo','')}\n")
+        f.write(f"DUPLICADO APROXIMADO: {item.get('duplicado_aproximado')}\n")
+        f.write(f"ANOS CITADOS: {', '.join(item.get('anos_citados', []))}\n")
+        f.write(f"TAMANHO: {item.get('tamanho_texto')}\n\n")
+        f.write(item.get("texto", ""))
+        f.write("\n\n")
+
+print(f"Corpus JSON: {saida_json}")
+print(f"Corpus TXT: {saida_txt}")
+print(f"Total itens: {len(resultados)}")
+PY
+
+python scripts/extrair_unificado.py
+
+echo "== Gerando linha do tempo, índice e dossiê final =="
+
+cat > scripts/gerar_dossie_final.py <<'PY'
+import os
+import re
+import json
+from collections import defaultdict, Counter
+
+BASE = os.path.expanduser("~/pesquisa_singular_densa")
+CORPUS = os.path.join(BASE, "json", "corpus_unificado.json")
+
+with open(CORPUS, "r", encoding="utf-8") as f:
+    dados = json.load(f)
+
+termos = [
+    "1966", "1970", "1971", "1972", "1978", "1990", "1993", "2000",
+    "2007", "2008", "2013", "2019",
+    "Curso Pré-Engenharia", "Pré-Engenharia", "Ciências e Letras",
+    "Liceu Monteiro Lobato", "Sistema Anglo", "Singular Anglo",
+    "Santo André", "São Bernardo", "São Caetano",
+    "High School", "bilíngue", "bilingue",
+    "University of Missouri", "Texas Tech", "Cambridge",
+    "fundação", "fundado", "história", "trajetória",
+    "vestibular", "colégio", "educação infantil", "ensino médio",
+    "ensino fundamental", "faculdade", "parceria", "unidade"
+]
+
+eventos = []
+por_ano_fato = defaultdict(list)
+por_origem = Counter()
+termos_contador = Counter()
+arquivos_relevantes = []
+
+for item in dados:
+    if item.get("erro"):
+        continue
+
+    texto = item.get("texto") or ""
+    origem = item.get("origem") or ""
+    arquivo = item.get("arquivo") or ""
+    titulo = item.get("titulo") or ""
+
+    por_origem[origem] += 1
+
+    termos_encontrados = []
+    for termo in termos:
+        total = len(re.findall(re.escape(termo), texto, flags=re.IGNORECASE))
+        if total:
+            termos_contador[termo] += total
+            termos_encontrados.append(termo)
+
+    if termos_encontrados:
+        arquivos_relevantes.append({
+            "origem": origem,
+            "arquivo": arquivo,
+            "titulo": titulo,
+            "termos": termos_encontrados,
+            "anos": item.get("anos_citados", []),
+            "duplicado_aproximado": item.get("duplicado_aproximado", False),
+            "trecho": texto[:1800]
+        })
+
+    frases = re.split(r"(?<=[.!?])\s+", texto)
+
+    for frase in frases:
+        frase = " ".join(frase.split())
+        if len(frase) < 45:
+            continue
+
+        anos = re.findall(r"\b(18[0-9]{2}|19[0-9]{2}|20[0-9]{2})\b", frase)
+
+        if not anos:
+            continue
+
+        relevante = False
+        for termo in termos:
+            if re.search(re.escape(termo), frase, flags=re.IGNORECASE):
+                relevante = True
+                break
+
+        if not relevante:
+            continue
+
+        for ano in anos:
+            registro = {
+                "ano": int(ano),
+                "descricao": frase[:1400],
+                "origem": origem,
+                "arquivo": arquivo,
+                "titulo": titulo
+            }
+            eventos.append(registro)
+            por_ano_fato[int(ano)].append(registro)
+
+eventos.sort(key=lambda x: (x["ano"], x["origem"], x["arquivo"]))
+
+# Remove duplicatas de descrição muito próximas
+eventos_unicos = []
+vistas = set()
+
+for e in eventos:
+    chave = (e["ano"], e["descricao"][:250].lower())
+    if chave in vistas:
+        continue
+    vistas.add(chave)
+    eventos_unicos.append(e)
+
+rel = os.path.join(BASE, "relatorios")
+js = os.path.join(BASE, "json")
+os.makedirs(rel, exist_ok=True)
+os.makedirs(js, exist_ok=True)
+
+with open(os.path.join(js, "linha_tempo_densa.json"), "w", encoding="utf-8") as f:
+    json.dump(eventos_unicos, f, ensure_ascii=False, indent=2)
+
+with open(os.path.join(js, "arquivos_relevantes.json"), "w", encoding="utf-8") as f:
+    json.dump(arquivos_relevantes, f, ensure_ascii=False, indent=2)
+
+with open(os.path.join(rel, "00_resumo_coleta.txt"), "w", encoding="utf-8") as f:
+    f.write("RESUMO DA COLETA DENSA - SINGULAR\n")
+    f.write("=" * 100 + "\n\n")
+    f.write(f"Total de itens no corpus: {len(dados)}\n")
+    f.write(f"Total de eventos candidatos na linha do tempo: {len(eventos_unicos)}\n\n")
+
+    f.write("Itens por origem:\n")
+    for origem, total in por_origem.most_common():
+        f.write(f"- {origem}: {total}\n")
+
+    f.write("\nTermos mais encontrados:\n")
+    for termo, total in termos_contador.most_common():
+        f.write(f"- {termo}: {total}\n")
+
+with open(os.path.join(rel, "01_linha_tempo_densa.txt"), "w", encoding="utf-8") as f:
+    f.write("LINHA DO TEMPO DENSA - EXTRAIDA DE FONTES PUBLICAS\n")
+    f.write("=" * 100 + "\n\n")
+
+    ano_atual = None
+
+    for e in eventos_unicos:
+        if e["ano"] != ano_atual:
+            ano_atual = e["ano"]
+            f.write("\n" + "#" * 100 + "\n")
+            f.write(f"ANO: {ano_atual}\n")
+            f.write("#" * 100 + "\n\n")
+
+        f.write(f"- {e['descricao']}\n")
+        f.write(f"  Origem: {e['origem']}\n")
+        f.write(f"  Título: {e.get('titulo','')}\n")
+        f.write(f"  Arquivo local: {e['arquivo']}\n\n")
+
+with open(os.path.join(rel, "02_dossie_por_arquivo_relevante.txt"), "w", encoding="utf-8") as f:
+    f.write("DOSSIE POR ARQUIVO RELEVANTE\n")
+    f.write("=" * 100 + "\n\n")
+
+    for item in arquivos_relevantes:
+        f.write("-" * 100 + "\n")
+        f.write(f"Origem: {item['origem']}\n")
+        f.write(f"Arquivo: {item['arquivo']}\n")
+        f.write(f"Título: {item.get('titulo','')}\n")
+        f.write(f"Duplicado aproximado: {item.get('duplicado_aproximado')}\n")
+        f.write(f"Termos: {', '.join(item.get('termos', []))}\n")
+        f.write(f"Anos citados: {', '.join(item.get('anos', []))}\n\n")
+        f.write(item.get("trecho", ""))
+        f.write("\n\n")
+
+with open(os.path.join(rel, "03_indice_termos.txt"), "w", encoding="utf-8") as f:
+    f.write("INDICE DE TERMOS\n")
+    f.write("=" * 100 + "\n\n")
+
+    for termo in termos:
+        f.write("\n" + "#" * 100 + "\n")
+        f.write(f"TERMO: {termo}\n")
+        f.write("#" * 100 + "\n\n")
+
+        for item in arquivos_relevantes:
+            if termo in item.get("termos", []):
+                f.write(f"- Origem: {item['origem']}\n")
+                f.write(f"  Arquivo: {item['arquivo']}\n")
+                f.write(f"  Título: {item.get('titulo','')}\n")
+                f.write(f"  Anos: {', '.join(item.get('anos', []))}\n\n")
+
+with open(os.path.join(rel, "04_dossie_final_denso.txt"), "w", encoding="utf-8") as out:
+    for nome in [
+        "00_resumo_coleta.txt",
+        "01_linha_tempo_densa.txt",
+        "02_dossie_por_arquivo_relevante.txt",
+        "03_indice_termos.txt",
+    ]:
+        caminho = os.path.join(rel, nome)
+        out.write("\n\n")
+        out.write("=" * 120 + "\n")
+        out.write(nome + "\n")
+        out.write("=" * 120 + "\n\n")
+        with open(caminho, "r", encoding="utf-8", errors="ignore") as f:
+            out.write(f.read())
+
+print("Relatórios gerados em relatorios/")
+PY
+
+python scripts/gerar_dossie_final.py
+
+echo "== Gerando CSV simples da linha do tempo =="
+
+python - <<'PY'
+import os, json, csv
+
+BASE = os.path.expanduser("~/pesquisa_singular_densa")
+inp = os.path.join(BASE, "json", "linha_tempo_densa.json")
+out = os.path.join(BASE, "relatorios", "linha_tempo_densa.csv")
+
+with open(inp, "r", encoding="utf-8") as f:
+    dados = json.load(f)
+
+with open(out, "w", encoding="utf-8", newline="") as f:
+    w = csv.writer(f, delimiter=";")
+    w.writerow(["ano", "descricao", "origem", "titulo", "arquivo"])
+    for e in dados:
+        w.writerow([
+            e.get("ano"),
+            e.get("descricao"),
+            e.get("origem"),
+            e.get("titulo"),
+            e.get("arquivo"),
+        ])
+
+print(out)
+PY
+
+echo "== Compactando versão para Windows =="
+
+cd "$HOME"
+
+rm -f pesquisa_singular_densa_para_windows.zip
+rm -f pesquisa_singular_densa_completa_pesada.zip
+
+mkdir -p "$BASE/exportar_windows"
+
+cp "$BASE/relatorios/"*.txt "$BASE/exportar_windows/" 2>/dev/null || true
+cp "$BASE/relatorios/"*.csv "$BASE/exportar_windows/" 2>/dev/null || true
+cp "$BASE/json/linha_tempo_densa.json" "$BASE/exportar_windows/" 2>/dev/null || true
+cp "$BASE/json/arquivos_relevantes.json" "$BASE/exportar_windows/" 2>/dev/null || true
+cp "$BASE/links/"*.txt "$BASE/exportar_windows/" 2>/dev/null || true
+cp "$BASE/links/"*.csv "$BASE/exportar_windows/" 2>/dev/null || true
+
+zip -r pesquisa_singular_densa_para_windows.zip pesquisa_singular_densa/exportar_windows
+
+echo ""
+echo "Também será gerado um pacote completo pesado, sem o ambiente Python."
+echo "Se ficar grande demais, use apenas o ZIP para Windows."
+zip -r pesquisa_singular_densa_completa_pesada.zip pesquisa_singular_densa \
+  -x "pesquisa_singular_densa/.venv/*" || true
+
+echo ""
+echo "============================================================"
+echo "FINALIZADO"
+echo "============================================================"
+echo ""
+echo "Relatório principal:"
+echo "$BASE/relatorios/04_dossie_final_denso.txt"
+echo ""
+echo "Linha do tempo:"
+echo "$BASE/relatorios/01_linha_tempo_densa.txt"
+echo "$BASE/relatorios/linha_tempo_densa.csv"
+echo ""
+echo "Resumo:"
+echo "$BASE/relatorios/00_resumo_coleta.txt"
+echo ""
+echo "ZIP leve para Windows:"
+echo "$HOME/pesquisa_singular_densa_para_windows.zip"
+echo ""
+echo "ZIP completo pesado:"
+echo "$HOME/pesquisa_singular_densa_completa_pesada.zip"
+echo ""
+echo "Para abrir:"
+echo "less $BASE/relatorios/04_dossie_final_denso.txt"
+echo ""
+echo "Para pesquisar:"
+echo "rg -i '1966|fundação|história|Singular|Anglo|Liceu|São Bernardo|São Caetano|Santo André' $BASE"
